@@ -47,17 +47,13 @@ def clean_user_message(text):
 
     原始格式示例：
     ```
-    System: [2026-03-09 12:47:01 GMT+8] Slack DM from USER: 实际消息内容
+    System: [timestamp] Slack DM from user: 实际消息内容
 
     Conversation info (untrusted metadata):
-    ```json
     { ... }
-    ```
 
     Sender (untrusted metadata):
-    ```json
     { ... }
-    ```
 
     实际消息内容
     ```
@@ -65,6 +61,7 @@ def clean_user_message(text):
     我们只保留最后一部分"实际消息内容"。
     """
     # 去掉开头的 "System: [timestamp] Slack DM from user: " 前缀
+    # 格式示例: "System: [2026-03-09 12:47:01 GMT+8] Slack DM from user: 实际消息内容"
     text = re.sub(r'^System:\s*\[.*?\]\s*Slack\s+\w+\s+from\s+\S+:\s*', '', text)
 
     # 去掉 "Conversation info (untrusted metadata):" 及其后面的 json block
@@ -141,9 +138,8 @@ CATEGORY_KEYWORDS = {
         "search", "send", "generate", "download", "upload",
     ],
     "生活杂聊": [
-        "REDACTED", "REDACTED", "REDACTED", "搞笑", "笑话", "REDACTED", "REDACTED",
         "电影", "音乐", "游戏", "美食", "旅游", "运动",
-        "REDACTED", "孩子", "妈妈", "爸爸", "家人",
+        "孩子", "家人",
         "开心", "无聊", "累了", "早安", "晚安", "周末",
     ],
     "知识讨论": [
