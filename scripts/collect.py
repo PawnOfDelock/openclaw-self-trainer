@@ -2,23 +2,36 @@
 """
 OpenClaw Self-Trainer - 数据收集脚本
 
-从 OpenClaw session 日志中提取对话，清洗元数据噪音，分类并追加到训练集。
+从 OpenClaw session 日志中提取完整的多轮交互链，输出 OpenAI messages 格式。
 
 Session 日志格式：
 - 位置: ~/.openclaw/agents/main/sessions/*.jsonl
-- 每行一个 JSON 对象，type 可以是: session, message, text, toolCall, custom 等
-- message 中 role 可以是 user 或 assistant
-- assistant 消息可能包含 text 和 toolCall
-- user 消息包含 Slack 元数据前缀，需要清洗
+- 每行一个 JSON 对象，type 可以是: session, message, custom 等
+- message.role: user / assistant / toolResult
+- assistant 消息可包含 text、toolCall、thinking block
+- toolResult 消息包含工具执行的返回结果
+- user 消息包含 Slack 元数据前缀，保留原始格式用于训练
+
+输出格式 (OpenAI messages):
+{
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."},    // 可含 think + toolCall + text
+    {"role": "tool", "content": "...", "tool_call_id": "..."},
+    {"role": "assistant", "content": "..."},    // 根据工具结果继续
+    ...
+  ],
+  "metadata": {"category": "...", "session_id": "...", "timestamp": "..."}
+}
 """
 
 import argparse
 import json
-import os
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -31,7 +44,6 @@ DEFAULT_DATA_DIR = Path.home() / ".cache" / "self-trainer" / "data"
 
 
 def load_config(config_path=None):
-    import yaml
     path = Path(config_path) if config_path else DEFAULT_CONFIG
     if path.exists():
         with open(path) as f:
@@ -42,91 +54,45 @@ def load_config(config_path=None):
 # ─── 数据清洗 ───────────────────────────────────────────
 
 def clean_user_message(text):
-    """
-    清洗 OpenClaw user 消息中的元数据噪音。
-
-    原始格式示例：
-    ```
-    System: [timestamp] Slack DM from user: 实际消息内容
-
-    Conversation info (untrusted metadata):
-    { ... }
-
-    Sender (untrusted metadata):
-    { ... }
-
-    实际消息内容
-    ```
-
-    我们只保留最后一部分"实际消息内容"。
-    """
-    # 去掉开头的 "System: [timestamp] Slack DM from user: " 前缀
-    # 格式示例: "System: [2026-03-09 12:47:01 GMT+8] Slack DM from user: 实际消息内容"
+    """清洗用户消息，仅用于分类统计（不影响训练数据中的原始格式）"""
     text = re.sub(r'^System:\s*\[.*?\]\s*Slack\s+\w+\s+from\s+\S+:\s*', '', text)
-
-    # 去掉 "Conversation info (untrusted metadata):" 及其后面的 json block
     text = re.sub(r'Conversation info \(untrusted metadata\):\s*\n```json\s*\n.*?```\s*\n', '', text, flags=re.DOTALL)
-
-    # 去掉 "Sender (untrusted metadata):" 及其后面的 json block
     text = re.sub(r'Sender \(untrusted metadata\):\s*\n```json\s*\n.*?```\s*\n', '', text, flags=re.DOTALL)
-
-    # 去掉 "Inbound Context (trusted metadata):" 及其后面的 json block
     text = re.sub(r'Inbound Context \(trusted metadata\):\s*\n```json\s*\n.*?```\s*\n', '', text, flags=re.DOTALL)
-
     return text.strip()
 
 
-def clean_assistant_message(text):
-    """清洗 assistant 消息，去掉系统标签"""
-    # 去掉 NO_REPLY（单独的回复）
-    if text.strip() == "NO_REPLY":
-        return None
+def should_skip_message(text):
+    """检查是否应该跳过的系统消息"""
+    stripped = text.strip()
+    return stripped in ("NO_REPLY", "HEARTBEAT_OK", "")
 
-    # 去掉 HEARTBEAT_OK
-    if text.strip() == "HEARTBEAT_OK":
-        return None
 
-    # 去掉常见的系统前缀
-    for prefix in ["[[reply_to_current]] ", "[reply_to:", "[[reply_to:"]:
+def clean_assistant_text(text):
+    """清洗 assistant 文本，去掉 reply_to 标签"""
+    if should_skip_message(text):
+        return None
+    for prefix in ["[[reply_to_current]] ", "[[reply_to:"]:
         if text.startswith(prefix):
-            text = text[len(prefix):]
-            # 如果是 [[reply_to_current]] 后面紧跟内容
-            if text.startswith("]] "):
-                text = text[3:]
-
+            idx = text.find("]] ")
+            if idx != -1:
+                text = text[idx + 3:]
+            else:
+                text = text[len(prefix):]
     return text.strip() if text.strip() else None
-
-
-def extract_tool_calls(message_content):
-    """从 assistant 消息中提取工具调用信息"""
-    tool_calls = []
-    if not isinstance(message_content, list):
-        return tool_calls
-
-    for block in message_content:
-        if isinstance(block, dict) and block.get("type") == "toolCall":
-            tool_calls.append({
-                "name": block.get("name", ""),
-                "arguments": block.get("arguments", {}),
-            })
-
-    return tool_calls
 
 
 # ─── 分类 ───────────────────────────────────────────────
 
-# 分类关键词（中文 + 英文）
 CATEGORY_KEYWORDS = {
     "技术开发": [
-        # 中文
         "代码", "脚本", "编程", "debug", "部署", "训练", "模型", "微调", "sft",
         "gpu", "cuda", "显存", "loRA", "checkpoint", "权重", "epoch",
-        "deepseed", "openclaw", "api", "plugin", "skill", "插件",
+        "openclaw", "api", "plugin", "skill", "插件",
         "仓库", "repo", "commit", "pr", "issue", "branch", "merge",
         "服务器", "docker", "容器", "nginx", "ssl", "证书",
         "python", "javascript", "typescript", "node", "npm", "pip",
         "数据库", "sql", "redis", "缓存", "框架", "架构",
-        # 英文
         "code", "script", "deploy", "train", "fine-tune", "model",
         "github", "git", "docker", "kubernetes", "k8s",
     ],
@@ -155,34 +121,87 @@ def classify(text):
     """基于关键词的文本分类"""
     text_lower = text.lower()
     scores = defaultdict(int)
-
     for category, keywords in CATEGORY_KEYWORDS.items():
         for kw in keywords:
             if kw in text_lower:
                 scores[category] += 1
-
-    if not scores:
-        return "其他"
-
-    return max(scores, key=scores.get)
+    return max(scores, key=scores.get) if scores else "其他"
 
 
-# ─── Session 解析 ──────────────────────────────────────
+# ─── 完整交互链解析 ────────────────────────────────────
 
-def parse_session(session_path):
+def extract_text_from_content(content):
+    """从消息 content 中提取纯文本"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+        return "\n".join(texts) if texts else ""
+    return ""
+
+
+def format_assistant_content(content_blocks):
     """
-    解析单个 session 文件，提取对话对。
+    将 assistant 消息的 content blocks 格式化为单个字符串。
+    
+    保留完整的思考链 + 工具调用 + 文本回复，用于 SFT 训练。
+    
+    格式：
+    <think reasoning_content>
+    思考内容...
+    </think_text>
+    
+    {"type":"tool_call","name":"exec","arguments":{"command":"..."}}
+    """
+    if not isinstance(content_blocks, list):
+        # 纯文本
+        cleaned = clean_assistant_text(str(content_blocks))
+        return cleaned or ""
 
+    parts = []
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+
+        btype = block.get("type", "")
+
+        if btype == "text":
+            text = clean_assistant_text(block.get("text", ""))
+            if text:
+                parts.append(text)
+
+        elif btype == "toolCall":
+            tool_call = {
+                "type": "tool_call",
+                "name": block.get("name", ""),
+                "arguments": block.get("arguments", {}),
+            }
+            parts.append(json.dumps(tool_call, ensure_ascii=False))
+
+    return "\n\n".join(parts)
+
+
+def parse_session_to_conversations(session_path):
+    """
+    解析 session 文件，提取完整的多轮交互链（OpenAI messages 格式）。
+    
+    每个 conversation 是一轮 user -> [assistant + toolResult 交替] 的完整链。
+    
     返回: list of {
-        "user_input": str,       # 清洗后的用户输入
-        "assistant_text": str,   # assistant 的文本回复
-        "tool_calls": list,      # assistant 的工具调用
-        "category": str,         # 分类
-        "timestamp": str,        # 时间戳
-        "session_id": str,       # session ID
+        "messages": [...],  # OpenAI messages 格式
+        "metadata": {
+            "category": str,
+            "session_id": str,
+            "timestamp": str,
+            "turns": int,         # user 轮数
+            "tool_calls": int,    # 总工具调用数
+        }
     }
     """
-    messages = []
+    raw_messages = []
     with open(session_path) as f:
         for line in f:
             line = line.strip()
@@ -191,80 +210,100 @@ def parse_session(session_path):
             try:
                 obj = json.loads(line)
                 if obj.get("type") == "message":
-                    msg = obj.get("message", {})
-                    messages.append(msg)
+                    raw_messages.append({
+                        "role": obj.get("message", {}).get("role", ""),
+                        "content": obj.get("message", {}).get("content", []),
+                        "timestamp": obj.get("timestamp", ""),
+                    })
             except json.JSONDecodeError:
                 continue
 
-    # 提取 session ID（从文件名或第一条 session 记录）
+    if not raw_messages:
+        return []
+
     session_id = session_path.stem
-
-    # 构建 user -> assistant 对话对
     conversations = []
+
+    # 按 user 消息分割成多个 conversation
+    # 每个 conversation 从一个 user 消息开始，到下一个 user 消息之前结束
     i = 0
-    while i < len(messages):
-        msg = messages[i]
-        role = msg.get("role", "")
-
-        if role == "user":
-            # 提取用户文本（保留原始格式用于训练）
-            user_text_raw = ""
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        user_text_raw = block.get("text", "")
-                        break
-            elif isinstance(content, str):
-                user_text_raw = content
-
-            if not user_text_raw.strip():
-                i += 1
-                continue
-
-            # 清洗版本仅用于分类（不影响存储的原始文本）
-            user_text_clean = clean_user_message(user_text_raw)
-
-            # 找到下一个 assistant 回复
-            j = i + 1
-            assistant_texts = []
-            assistant_tool_calls = []
-            while j < len(messages) and messages[j].get("role") != "user":
-                if messages[j].get("role") == "assistant":
-                    content = messages[j].get("content", [])
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict):
-                                if block.get("type") == "text":
-                                    cleaned = clean_assistant_message(block.get("text", ""))
-                                    if cleaned:
-                                        assistant_texts.append(cleaned)
-                                elif block.get("type") == "toolCall":
-                                    assistant_tool_calls.append({
-                                        "name": block.get("name", ""),
-                                        "args_keys": list(block.get("arguments", {}).keys()),
-                                    })
-                    elif isinstance(content, str):
-                        cleaned = clean_assistant_message(content)
-                        if cleaned:
-                            assistant_texts.append(cleaned)
-                j += 1
-
-            if assistant_texts:
-                combined_text = "\n".join(assistant_texts)
-                conversations.append({
-                    "user_input": user_text_raw,        # 保留原始格式（含元数据）用于训练
-                    "user_input_clean": user_text_clean, # 清洗版用于分类/分析
-                    "assistant_text": combined_text,
-                    "tool_calls": assistant_tool_calls,
-                    "category": classify(user_text_clean),
-                    "timestamp": msg.get("timestamp", ""),
-                    "session_id": session_id,
-                })
-
-            i = j
-        else:
+    while i < len(raw_messages):
+        msg = raw_messages[i]
+        if msg["role"] != "user":
             i += 1
+            continue
+
+        # 新 conversation 开始
+        messages = []
+        first_timestamp = msg["timestamp"]
+        tool_call_count = 0
+
+        # 添加 user 消息（保留原始格式，含元数据）
+        user_text = extract_text_from_content(msg["content"])
+        if not user_text.strip():
+            i += 1
+            continue
+        messages.append({"role": "user", "content": user_text})
+
+        # 收集后续的 assistant / toolResult 消息
+        j = i + 1
+        while j < len(raw_messages) and raw_messages[j]["role"] != "user":
+            rmsg = raw_messages[j]
+            role = rmsg["role"]
+
+            if role == "assistant":
+                # 格式化 assistant 完整内容（思考 + 工具调用 + 文本）
+                content_blocks = rmsg["content"]
+                if isinstance(content_blocks, list):
+                    # 检查是否有文本（跳过纯 NO_REPLY）
+                    has_text = any(
+                        isinstance(b, dict) and b.get("type") == "text" and clean_assistant_text(b.get("text", ""))
+                        for b in content_blocks if isinstance(b, dict)
+                    )
+                    has_tools = any(
+                        isinstance(b, dict) and b.get("type") == "toolCall"
+                        for b in content_blocks if isinstance(b, dict)
+                    )
+                    if not has_text and not has_tools:
+                        j += 1
+                        continue
+
+                formatted = format_assistant_content(content_blocks)
+                if formatted.strip():
+                    messages.append({"role": "assistant", "content": formatted})
+                    # 统计工具调用
+                    if isinstance(content_blocks, list):
+                        for b in content_blocks:
+                            if isinstance(b, dict) and b.get("type") == "toolCall":
+                                tool_call_count += 1
+
+            elif role == "toolResult":
+                # 工具返回结果
+                result_text = extract_text_from_content(rmsg["content"])
+                if result_text.strip():
+                    messages.append({"role": "tool", "content": result_text})
+
+            j += 1
+
+        # 只保留有 assistant 回复的 conversation
+        has_assistant = any(m["role"] == "assistant" for m in messages)
+        if has_assistant and len(messages) >= 2:
+            # 用第一条 user 消息的清洗版做分类
+            clean_input = clean_user_message(user_text)
+            messages_out = [{"role": "system", "content": "你是一个 AI 助手。"}] + messages
+
+            conversations.append({
+                "messages": messages_out,
+                "metadata": {
+                    "category": classify(clean_input),
+                    "session_id": session_id,
+                    "timestamp": first_timestamp,
+                    "turns": sum(1 for m in messages if m["role"] == "user"),
+                    "tool_calls": tool_call_count,
+                },
+            })
+
+        i = j
 
     return conversations
 
@@ -280,77 +319,98 @@ def init_data_dir(data_dir=None):
     return base
 
 
-def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False, analyze_only=False):
-    """从 OpenClaw session 日志收集对话
+def collect_sessions(sessions_dir=None, data_dir=None, dry_run=False, analyze_only=False):
+    """
+    从 OpenClaw session 日志收集完整交互链。
     
-    analyze_only: 只输出分类统计（用清洗后的文本分类），不保存训练数据
+    输出 OpenAI messages 格式，包含：
+    - system prompt
+    - user 消息（保留原始元数据）
+    - assistant 完整回复（思考链 + 工具调用 + 文本）
+    - tool 返回结果
     """
     sessions_dir = Path(sessions_dir) if sessions_dir else DEFAULT_SESSIONS_DIR
     data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
     config = load_config()
-    cleaning = config.get("cleaning", {})
 
     if not sessions_dir.exists():
         print(f"❌ Session 目录不存在: {sessions_dir}")
         return []
 
-    # 收集所有 session 文件
     session_files = sorted(sessions_dir.glob("*.jsonl"))
     print(f"📂 找到 {len(session_files)} 个 session 文件")
 
     # 解析所有 session
-    all_conversations = []
+    all_convs = []
     for sf in session_files:
         try:
-            convs = parse_session(sf)
-            all_conversations.extend(convs)
+            convs = parse_session_to_conversations(sf)
+            all_convs.extend(convs)
         except Exception as e:
             print(f"  ⚠️ 解析失败 {sf.name}: {e}")
 
-    print(f"📊 解析出 {len(all_conversations)} 条对话对")
+    print(f"📊 解析出 {len(all_convs)} 条交互链")
 
-    # 去重（基于清洗后的 user_input 相似度）
-    seen_inputs = set()
-    unique_conversations = []
-    for conv in all_conversations:
-        # 简单去重：完全相同的 input（用清洗版比较）
-        input_key = conv["user_input_clean"][:100]
-        if input_key not in seen_inputs:
-            seen_inputs.add(input_key)
-            unique_conversations.append(conv)
+    # 去重（基于第一条 user 消息的清洗版）
+    seen = set()
+    unique = []
+    for conv in all_convs:
+        msgs = conv["messages"]
+        user_msgs = [m["content"] for m in msgs if m["role"] == "user"]
+        if user_msgs:
+            key = clean_user_message(user_msgs[0])[:100]
+            if key not in seen:
+                seen.add(key)
+                unique.append(conv)
 
-    dedup_count = len(all_conversations) - len(unique_conversations)
+    dedup_count = len(all_convs) - len(unique)
     if dedup_count > 0:
-        print(f"🔄 去重后保留 {len(unique_conversations)} 条（去掉 {dedup_count} 条重复）")
+        print(f"🔄 去重后保留 {len(unique)} 条（去掉 {dedup_count} 条重复）")
 
-    # 清洗：长度过滤（基于清洗后的文本）
+    # 过滤：太短的交互链
     cleaned = []
-    for conv in unique_conversations:
-        if len(conv["user_input_clean"]) < cleaning.get("min_input_length", 5):
-            continue
-        if len(conv["assistant_text"]) < cleaning.get("min_output_length", 10):
-            continue
-        if len(conv["assistant_text"]) > cleaning.get("max_output_length", 4096):
+    for conv in unique:
+        msgs = conv["messages"]
+        # 计算总 token 估算（粗略：1 token ≈ 2 字符）
+        total_chars = sum(len(m["content"]) for m in msgs)
+        if total_chars < 20:  # 太短
             continue
         cleaned.append(conv)
 
-    filter_count = len(unique_conversations) - len(cleaned)
+    filter_count = len(unique) - len(cleaned)
     if filter_count > 0:
-        print(f"🔍 长度过滤后保留 {len(cleaned)} 条（去掉 {filter_count} 条）")
+        print(f"🔍 过滤后保留 {len(cleaned)} 条（去掉 {filter_count} 条过短）")
+
+    # 统计
+    category_counts = defaultdict(int)
+    tool_call_counts = defaultdict(int)
+    has_tool = 0
+    multi_turn = 0
+    for conv in cleaned:
+        cat = conv["metadata"]["category"]
+        category_counts[cat] += 1
+        tc = conv["metadata"]["tool_calls"]
+        tool_call_counts[cat] += tc
+        if tc > 0:
+            has_tool += 1
+        if conv["metadata"]["turns"] > 1:
+            multi_turn += 1
 
     if dry_run or analyze_only:
-        # 只打印统计，不写入文件
         mode = "分析" if analyze_only else "干运行"
         print(f"\n📊 {mode}结果：")
-        print(f"   总对话对: {len(cleaned)}")
-        category_counts = defaultdict(int)
-        for c in cleaned:
-            category_counts[c["category"]] += 1
+        print(f"   总交互链: {len(cleaned)}")
+        print(f"   含工具调用: {has_tool} ({has_tool/len(cleaned)*100:.1f}%)" if cleaned else "")
+        print(f"   多轮对话: {multi_turn} ({multi_turn/len(cleaned)*100:.1f}%)" if cleaned else "")
+        print(f"\n   分类分布:")
         for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
-            print(f"   {cat}: {count} ({count/len(cleaned)*100:.1f}%)")
+            bar = "█" * int(count / len(cleaned) * 20) if cleaned else ""
+            print(f"   {cat:8s} {count:4d} ({count/len(cleaned)*100:5.1f}%) {bar}")
+            if tool_call_counts[cat] > 0:
+                print(f"           └─ 工具调用: {tool_call_counts[cat]}")
         return cleaned
 
-    # 保存训练数据（保留原始 user_input 用于训练，user_input_clean 用于分析）
+    # 保存训练数据
     today = datetime.now().strftime("%Y-%m-%d")
     out_path = data_dir / "cleaned" / f"{today}.jsonl"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -358,26 +418,17 @@ def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False
 
     with open(out_path, "w") as f:
         for conv in cleaned:
-            # 训练用：保留原始格式（含元数据），模拟真实推理环境
-            # 分析用：user_input_clean 已清洗，用于分类统计
-            f.write(json.dumps({
-                "input": conv["user_input"],
-                "output": conv["assistant_text"],
-                "category": conv["category"],
-                "tool_calls": conv["tool_calls"],
-                "timestamp": conv["timestamp"],
-                "session_id": conv["session_id"],
-            }, ensure_ascii=False) + "\n")
+            f.write(json.dumps(conv, ensure_ascii=False) + "\n")
 
     print(f"💾 保存到 {out_path}")
-
-    # 打印分类统计
-    category_counts = defaultdict(int)
-    for c in cleaned:
-        category_counts[c["category"]] += 1
-    print(f"\n📈 分类统计:")
+    print(f"\n📈 分类分布:")
     for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
-        print(f"   {cat}: {count} ({count/len(cleaned)*100:.1f}%)")
+        bar = "█" * int(count / len(cleaned) * 20) if cleaned else ""
+        print(f"   {cat:8s} {count:4d} ({count/len(cleaned)*100:5.1f}%) {bar}")
+
+    print(f"\n📊 工具调用统计:")
+    for cat, tc in sorted(tool_call_counts.items(), key=lambda x: -x[1]):
+        print(f"   {cat:8s} {tc} 次工具调用")
 
     return cleaned
 
@@ -388,15 +439,12 @@ def check_installation(data_dir=None):
     sessions_dir = DEFAULT_SESSIONS_DIR
     checks = []
 
-    # 检查目录
     checks.append(("Session 目录", sessions_dir.exists()))
     if sessions_dir.exists():
         session_count = len(list(sessions_dir.glob("*.jsonl")))
         checks.append((f"  Session 文件数", True, f"{session_count}"))
-
     checks.append(("数据目录", data_dir.exists()))
 
-    # 检查 Python 依赖
     deps = [("PyYAML", "yaml"), ("scikit-learn", "sklearn"), ("jieba", "jieba")]
     for name, module in deps:
         try:
@@ -405,10 +453,9 @@ def check_installation(data_dir=None):
         except ImportError:
             checks.append((name, False))
 
-    # 检查 GPU（可选）
     try:
         import torch
-        checks.append((f"PyTorch CUDA", torch.cuda.is_available()))
+        checks.append(("PyTorch CUDA", torch.cuda.is_available()))
     except ImportError:
         checks.append(("PyTorch", False))
 
@@ -418,25 +465,20 @@ def check_installation(data_dir=None):
     except ImportError:
         checks.append(("DeepSpeed (可选)", False))
 
-    all_passed = all(c[1] for c in checks)
     for item in checks:
-        name = item[0]
-        ok = item[1]
+        name, ok = item[0], item[1]
         extra = f" ({item[2]})" if len(item) > 2 else ""
         print(f"  {'✅' if ok else '❌'} {name}{extra}")
 
-    if all_passed:
-        print("\n✅ All checks passed")
-    else:
-        print("\n⚠️ 部分检查未通过，核心功能仍可使用（数据收集不依赖 GPU）")
-
-    return all_passed
+    all_ok = all(c[1] for c in checks)
+    print(f"\n{'✅ All checks passed' if all_ok else '⚠️ 部分检查未通过，核心功能仍可使用'}")
+    return all_ok
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OpenClaw Self-Trainer 数据收集")
     parser.add_argument("--init", action="store_true", help="初始化数据目录")
-    parser.add_argument("--collect", action="store_true", help="收集并清洗数据，保存训练集")
+    parser.add_argument("--collect", action="store_true", help="收集完整交互链，保存训练集")
     parser.add_argument("--analyze", action="store_true", help="只输出分类统计，不保存文件")
     parser.add_argument("--check", action="store_true", help="检查安装状态")
     parser.add_argument("--dry-run", action="store_true", help="只统计不写入文件")
@@ -448,16 +490,9 @@ if __name__ == "__main__":
     if args.init:
         init_data_dir(args.data_dir)
     elif args.collect:
-        collect_sessions(
-            sessions_dir=args.sessions_dir,
-            data_dir=args.data_dir,
-            dry_run=args.dry_run,
-        )
+        collect_sessions(sessions_dir=args.sessions_dir, data_dir=args.data_dir, dry_run=args.dry_run)
     elif args.analyze:
-        collect_sessions(
-            sessions_dir=args.sessions_dir,
-            analyze_only=True,
-        )
+        collect_sessions(sessions_dir=args.sessions_dir, analyze_only=True)
     elif args.check:
         check_installation(args.data_dir)
     else:
