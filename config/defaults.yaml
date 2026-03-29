@@ -1,0 +1,47 @@
+# Self-Trainer 默认配置
+
+# 训练参数
+training:
+  min_new_samples: 50        # 至少多少条新数据才触发训练
+  epochs: 3
+  batch_size: 4
+  learning_rate: 2.0e-5
+  max_seq_length: 2048
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+
+# 数据集切分
+dataset:
+  val_ratio: 0.08            # 验证集比例
+  test_ratio: 0.07           # 测试集比例（首次切分后锁定）
+
+# 评估参数
+evaluation:
+  deploy_threshold: 0.80     # 准确率 ≥ 此值才部署
+  rollback_threshold: 0.70   # 准确率 < 此值自动回滚
+
+  weights:
+    task_completion: 0.4     # 任务完成度
+    hallucination: 0.3       # 幻觉检测
+    instruction_following: 0.2  # 指令遵循
+    format_correctness: 0.1  # 格式正确性
+
+# 路由参数
+routing:
+  max_history_turns: 10      # 超过此轮数的对话路由给大模型
+  timeout_seconds: 30        # 小模型超时后回退大模型
+  enable_fallback: true      # 是否启用大模型兜底
+
+# 路径
+paths:
+  data_dir: ~/.cache/self-trainer/data
+  models_dir: ~/.cache/self-trainer/models
+  reports_dir: ~/.cache/self-trainer/data/reports
+  config_dir: ~/.cache/self-trainer/config
+
+# 数据清洗
+cleaning:
+  remove_metadata_prefix: true    # 去掉 OpenClaw 元数据前缀
+  min_input_length: 5             # 最短 input 长度
+  min_output_length: 10            # 最短 output 长度
+  max_output_length: 4096          # 最长 output 长度
