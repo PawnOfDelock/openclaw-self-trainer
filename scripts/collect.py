@@ -207,21 +207,23 @@ def parse_session(session_path):
         role = msg.get("role", "")
 
         if role == "user":
-            # 提取用户文本
-            user_text = ""
+            # 提取用户文本（保留原始格式用于训练）
+            user_text_raw = ""
             content = msg.get("content", [])
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        user_text = block.get("text", "")
+                        user_text_raw = block.get("text", "")
                         break
             elif isinstance(content, str):
-                user_text = content
+                user_text_raw = content
 
-            user_text = clean_user_message(user_text)
-            if not user_text:
+            if not user_text_raw.strip():
                 i += 1
                 continue
+
+            # 清洗版本仅用于分类（不影响存储的原始文本）
+            user_text_clean = clean_user_message(user_text_raw)
 
             # 找到下一个 assistant 回复
             j = i + 1
@@ -251,10 +253,11 @@ def parse_session(session_path):
             if assistant_texts:
                 combined_text = "\n".join(assistant_texts)
                 conversations.append({
-                    "user_input": user_text,
+                    "user_input": user_text_raw,        # 保留原始格式（含元数据）用于训练
+                    "user_input_clean": user_text_clean, # 清洗版用于分类/分析
                     "assistant_text": combined_text,
                     "tool_calls": assistant_tool_calls,
-                    "category": classify(user_text),
+                    "category": classify(user_text_clean),
                     "timestamp": msg.get("timestamp", ""),
                     "session_id": session_id,
                 })
@@ -277,8 +280,11 @@ def init_data_dir(data_dir=None):
     return base
 
 
-def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False):
-    """从 OpenClaw session 日志收集对话"""
+def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False, analyze_only=False):
+    """从 OpenClaw session 日志收集对话
+    
+    analyze_only: 只输出分类统计（用清洗后的文本分类），不保存训练数据
+    """
     sessions_dir = Path(sessions_dir) if sessions_dir else DEFAULT_SESSIONS_DIR
     data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
     config = load_config()
@@ -303,12 +309,12 @@ def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False
 
     print(f"📊 解析出 {len(all_conversations)} 条对话对")
 
-    # 去重（基于 user_input 相似度）
+    # 去重（基于清洗后的 user_input 相似度）
     seen_inputs = set()
     unique_conversations = []
     for conv in all_conversations:
-        # 简单去重：完全相同的 input
-        input_key = conv["user_input"][:100]  # 取前100字符作为指纹
+        # 简单去重：完全相同的 input（用清洗版比较）
+        input_key = conv["user_input_clean"][:100]
         if input_key not in seen_inputs:
             seen_inputs.add(input_key)
             unique_conversations.append(conv)
@@ -317,10 +323,10 @@ def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False
     if dedup_count > 0:
         print(f"🔄 去重后保留 {len(unique_conversations)} 条（去掉 {dedup_count} 条重复）")
 
-    # 清洗：长度过滤
+    # 清洗：长度过滤（基于清洗后的文本）
     cleaned = []
     for conv in unique_conversations:
-        if len(conv["user_input"]) < cleaning.get("min_input_length", 5):
+        if len(conv["user_input_clean"]) < cleaning.get("min_input_length", 5):
             continue
         if len(conv["assistant_text"]) < cleaning.get("min_output_length", 10):
             continue
@@ -332,9 +338,10 @@ def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False
     if filter_count > 0:
         print(f"🔍 长度过滤后保留 {len(cleaned)} 条（去掉 {filter_count} 条）")
 
-    if dry_run:
+    if dry_run or analyze_only:
         # 只打印统计，不写入文件
-        print(f"\n📊 干运行结果：")
+        mode = "分析" if analyze_only else "干运行"
+        print(f"\n📊 {mode}结果：")
         print(f"   总对话对: {len(cleaned)}")
         category_counts = defaultdict(int)
         for c in cleaned:
@@ -343,7 +350,7 @@ def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False
             print(f"   {cat}: {count} ({count/len(cleaned)*100:.1f}%)")
         return cleaned
 
-    # 保存
+    # 保存训练数据（保留原始 user_input 用于训练，user_input_clean 用于分析）
     today = datetime.now().strftime("%Y-%m-%d")
     out_path = data_dir / "cleaned" / f"{today}.jsonl"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -351,7 +358,16 @@ def collect_sessions(sessions_dir=None, data_dir=None, since=None, dry_run=False
 
     with open(out_path, "w") as f:
         for conv in cleaned:
-            f.write(json.dumps(conv, ensure_ascii=False) + "\n")
+            # 训练用：保留原始格式（含元数据），模拟真实推理环境
+            # 分析用：user_input_clean 已清洗，用于分类统计
+            f.write(json.dumps({
+                "input": conv["user_input"],
+                "output": conv["assistant_text"],
+                "category": conv["category"],
+                "tool_calls": conv["tool_calls"],
+                "timestamp": conv["timestamp"],
+                "session_id": conv["session_id"],
+            }, ensure_ascii=False) + "\n")
 
     print(f"💾 保存到 {out_path}")
 
@@ -420,7 +436,8 @@ def check_installation(data_dir=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="OpenClaw Self-Trainer 数据收集")
     parser.add_argument("--init", action="store_true", help="初始化数据目录")
-    parser.add_argument("--collect", action="store_true", help="收集并清洗数据")
+    parser.add_argument("--collect", action="store_true", help="收集并清洗数据，保存训练集")
+    parser.add_argument("--analyze", action="store_true", help="只输出分类统计，不保存文件")
     parser.add_argument("--check", action="store_true", help="检查安装状态")
     parser.add_argument("--dry-run", action="store_true", help="只统计不写入文件")
     parser.add_argument("--sessions-dir", type=str, default=None, help="OpenClaw sessions 目录路径")
@@ -435,6 +452,11 @@ if __name__ == "__main__":
             sessions_dir=args.sessions_dir,
             data_dir=args.data_dir,
             dry_run=args.dry_run,
+        )
+    elif args.analyze:
+        collect_sessions(
+            sessions_dir=args.sessions_dir,
+            analyze_only=True,
         )
     elif args.check:
         check_installation(args.data_dir)
