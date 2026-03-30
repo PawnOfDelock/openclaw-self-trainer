@@ -24,7 +24,7 @@ RULES = [
     ("jwt",          r"eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+", "token", "JWT"),
     ("bearer",       r"[Bb]earer\s+[a-zA-Z0-9._\-]{20,}",   "token", "Bearer Token"),
     ("api_key_kv",   r'(?i)(?:api[_-]?key|apikey|api[_-]?secret)["\s:=]+([a-zA-Z0-9_\-]{16,})', "token", "API Key (kv)"),
-    ("password_kv",  r'(?i)(?:password|passwd|pwd)["\s:=]+([^\s"\',}{)\]]*[!@#$%^&*_\-+=`~][^\s"\',}{)\]]*)', "password", "Password (kv)"),
+    ("password_kv",  r'(?i)(?:password|passwd|pwd)["\s，,:=]+([^\s"\',)\]]*[!@#$%^&*_\-+=`~{}]+[^\s"\',)\]]*)', "password", "Password (kv)"),
     ("token_kv",     r'(?i)(?:token|secret[_-]?key|access[_-]?key)["\s:=]+([a-zA-Z0-9_\-]{16,})', "token", "Token (kv)"),
     ("ip",           r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b", "ip", "IP Address"),
     ("email",        r"[\w.\-]+@[\w.\-]+\.\w{2,}",         "email", "Email"),
@@ -34,12 +34,18 @@ RULES = [
     ("oauth",        r'(?i)client[_-]?secret["\s:=]+([a-zA-Z0-9_\-]{16,})', "token", "OAuth Secret"),
     ("connection_string", r'(?i)(?:mongodb|mysql|postgres|redis|amqp)://[^\s"\'>]+', "conn_str", "Connection String"),
     ("cred_field",   r'(?i)(?:credential|auth_token|session_id|oauth_token)["\s:=]+["\']?([a-zA-Z0-9_\-]{10,})["\']?', "uuid", "Credential Field"),
+    ("ssh_key",      r"ssh-(?:ed25519|rsa|ecdsa|dss)\s+[A-Za-z0-9+/=]{20,}", "ssh_key", "SSH Public Key"),
+    ("server_path",  r"/home/\w+(/\S*)?", "path", "Server Path"),
+    ("high_entropy", r"(?<![a-zA-Z])[A-Za-z0-9]{32,}(?![a-zA-Z])", "token", "High Entropy String"),
+    ("cn_password",  r'(?<![一-龥])密码[，,\s:]+([^\s"\',)\]）]{4,}[!@#$%^&*_\-+=`~{}]+[^\s"\',)\]）]*)', "password", "Password (Chinese kv)"),
 ]
 
 COMPILED = [(name, re.compile(pat), cat, desc) for name, pat, cat, desc in RULES]
 
 # KV 规则 — 有 group(1) 的是只取 value
 KV_RULES = {"api_key_kv", "password_kv", "token_kv", "oauth", "cred_field"}
+# 高熵规则需要额外过滤
+HIGH_ENTROPY_RULES = {"high_entropy"}
 
 
 # ========== 随机替换生成器 ==========
@@ -106,6 +112,15 @@ class ReplacementPool:
             h = self._hash_int(real_value, 100000)
             return f"db://user{h%100}:****@host{h%10}.local:5432/db"
         
+        elif category == "ssh_key":
+            h = self._hash_int(real_value, 100000)
+            key_type = "ed25519" if "ed25519" in real_value else "rsa"
+            fake_key = "x" * min(40, len(real_value) - len(key_type) - 1)
+            return f"ssh-{key_type} {fake_key}"
+        
+        elif category == "path":
+            return "/home/user"
+        
         else:
             return "****"
 
@@ -118,6 +133,28 @@ def scan_text(text):
             if name in KV_RULES and m.lastindex:
                 matched = m.group(1)
                 start, end = m.start(1), m.end(1)
+            elif name == "high_entropy":
+                # 高熵过滤：长度>=32，包含大小写+数字，熵>4.0
+                matched = m.group(0)
+                start, end = m.start(), m.end()
+                if len(matched) < 32:
+                    continue
+                import math, collections
+                freq = collections.Counter(matched)
+                length = len(matched)
+                entropy = -sum((c/length)*math.log2(c/length) for c in freq.values())
+                if entropy < 4.0:
+                    continue
+                # 排除已知误报模式
+                skip = False
+                for p in ['http://', 'https://', 'ssh-rsa', 'ssh-ed2', 'ssh-ec',
+                           'BEGIN ', 'PRIVATE', 'prepare_model', 'bnb_4bit',
+                           'micro_batch', 'trainable', 'reasoning_content']:
+                    if p in matched:
+                        skip = True
+                        break
+                if skip:
+                    continue
             else:
                 matched = m.group(0)
                 start, end = m.start(), m.end()
