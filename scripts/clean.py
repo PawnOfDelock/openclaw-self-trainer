@@ -9,11 +9,11 @@
 import json
 import re
 import sys
-import hashlib
+import random
 import random
 from collections import Counter
 
-random.seed(42)  # 可复现
+random.seed()  # 每次运行随机，防止字典攻击
 
 # ========== 规则定义 ==========
 RULES = [
@@ -57,13 +57,6 @@ class ReplacementPool:
         self._ip_counter = 0
         self._email_counter = 0
         self._token_counter = 0
-        self._password_counter = 0
-    
-    def _hash_int(self, s, max_val):
-        """确定性 hash → [0, max_val)"""
-        h = hashlib.sha256(s.encode()).hexdigest()
-        return int(h, 16) % max_val
-    
     def get(self, category, real_value):
         key = (category, real_value)
         if key in self._cache:
@@ -75,45 +68,34 @@ class ReplacementPool:
     
     def _generate(self, category, real_value):
         if category == "ip":
-            h = self._hash_int(real_value, 100000)
-            # 生成 198.51.x.x 范围的假 IP（RFC 5737 TEST-NET-2 附近）
-            return f"198.51.{h % 256}.{(h >> 8) % 254 + 1}"
+            return f"198.51.{random.randint(1,254)}.{random.randint(1,254)}"
         
         elif category == "email":
-            h = self._hash_int(real_value, 100000)
-            user = f"user{h % 1000}"
+            user = f"user{random.randint(100,999)}"
             domains = ["example.com", "example.org", "test.local", "sample.net", "demo.local"]
-            domain = domains[h % len(domains)]
-            return f"{user}@{domain}"
+            return f"{user}@{random.choice(domains)}"
         
         elif category == "token":
-            h = self._hash_int(real_value, 100000)
-            prefix = f"tk_{h % 10000:04d}"
+            prefix = f"tk_{random.randint(1000,9999):04d}"
             body = "x" * max(8, len(real_value) - len(prefix) - 1)
             return f"{prefix}_{body}"
         
         elif category == "password":
-            h = self._hash_int(real_value, 100000)
-            # 用等长占位符
             return "•" * len(real_value)
         
         elif category == "phone":
-            h = self._hash_int(real_value, 100000)
-            return f"138{h % 100000000:08d}"
+            return f"138{random.randint(10000000,99999999):08d}"
         
         elif category == "id_card":
             return "•" * 18
         
         elif category == "uuid":
-            h = self._hash_int(real_value, 100000)
-            return f"aaaaaaaa-{h % 10000:04x}-4bbb-cccc-{(h >> 4) % 0xffffffff:012x}"
+            return f"aaaaaaaa-{random.randint(0,0xffff):04x}-4bbb-cccc-{random.randint(0,0xffffffffffffffff):012x}"
         
         elif category == "conn_str":
-            h = self._hash_int(real_value, 100000)
-            return f"db://user{h%100}:****@host{h%10}.local:5432/db"
+            return f"db://user{random.randint(100,999)}:****@host{random.randint(1,9)}.local:5432/db"
         
         elif category == "ssh_key":
-            h = self._hash_int(real_value, 100000)
             key_type = "ed25519" if "ed25519" in real_value else "rsa"
             fake_key = "x" * min(40, len(real_value) - len(key_type) - 1)
             return f"ssh-{key_type} {fake_key}"
