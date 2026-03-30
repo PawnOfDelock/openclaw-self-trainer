@@ -25,47 +25,10 @@ Day 3: checkpoint_v2 + 30条新数据 → checkpoint_v3 → 评估
 
 ### 四个核心模块
 
-1. **数据管道** — 从 OpenClaw session 日志收集、清洗、分类对话数据
+1. **数据管道** — 从 OpenClaw session 日志收集、清洗、分类对话数据（敏感信息如密码、API Key 等会在数据清洗时做遮掩处理，不会被模型学到）
 2. **SFT 训练** — 用清洗后的数据微调本地小模型
 3. **自动评估** — 对比新旧模型，客观评估训练效果
 4. **智能路由** — 根据评估结果决定哪些请求可以分发给小模型
-
-### 数据清洗（敏感信息过滤）
-
-训练数据中可能包含真实敏感信息（IP、密码、Token、邮箱等），必须在训练前清除。
-
-**设计原则：**
-- 同一真实值 → 同一替换（全局一致，基于 `sha256` 哈希确定性生成）
-- 替换值保持上下文合理性（IP 还是 IP 格式、邮箱还是邮箱格式）
-- 替换值随机化，避免模型学习固定占位符
-
-**支持的敏感信息类型：**
-
-| 类型 | 说明 | 替换示例 |
-|------|------|----------|
-| IP 地址 | 公网/内网 IP | `54.123.45.67` → `198.51.170.142` |
-| 邮箱 | 个人/服务邮箱 | `user@gmail.com` → `user661@example.org` |
-| Token/API Key | 各平台密钥 | `clh_3Ld0bBQ...` → `tk_0625_xxxx...` |
-| 密码 | 含特殊字符的密码 | `7Fm842}7dhp{` → `••••••••••••` |
-| SSH 公钥 | ed25519/rsa 公钥 | `ssh-ed25519 AAAA...` → `ssh-ed25519 xxxx...` |
-| UUID/Session ID | 会话标识符 | `bbdf3f66...` → `aaaa-0e81-4bbb-cccc-...` |
-| 服务器路径 | `/home/user` 格式 | `/home/ubuntu/clawd` → `/home/user` |
-| 高熵字符串 | 无上下文的长随机串 | `adNHQ9MkV7ZSw...` → `tk_2959_xxxx...` |
-| 连接字符串 | DB/Redis 等连接串 | `mongodb://user:pass@host` → `db://user:****@host` |
-
-**使用方法：**
-
-```bash
-# 扫描并生成清洗报告
-python scripts/clean.py training_data.jsonl
-
-# 输出 training_data_sanitized.jsonl + 控制台报告（含 precision/recall 评估）
-```
-
-**实测效果（736条训练数据）：**
-- 检出 44 条含敏感信息的记录（33个唯一值）
-- Precision: 100%（零误报）
-- Recall: ~95%
 
 ### 闭环流程
 
