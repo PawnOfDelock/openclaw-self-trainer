@@ -36,6 +36,9 @@ from pathlib import Path
 
 import yaml
 
+# 允许同目录导入
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+
 
 # ─── 默认配置 ───────────────────────────────────────────
 DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "defaults.yaml"
@@ -413,6 +416,7 @@ def collect_sessions(sessions_dir=None, data_dir=None, dry_run=False, analyze_on
     # 保存训练数据
     today = datetime.now().strftime("%Y-%m-%d")
     out_path = data_dir / "cleaned" / f"{today}.jsonl"
+    sanitized_path = data_dir / "cleaned" / f"{today}_sanitized.jsonl"
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "cleaned").mkdir(parents=True, exist_ok=True)
 
@@ -421,6 +425,21 @@ def collect_sessions(sessions_dir=None, data_dir=None, dry_run=False, analyze_on
             f.write(json.dumps(conv, ensure_ascii=False) + "\n")
 
     print(f"💾 保存到 {out_path}")
+
+    # 敏感信息清洗
+    try:
+        from clean import process_file, print_report
+        stats = process_file(str(out_path), str(sanitized_path))
+        if stats["total_findings"] > 0:
+            print(f"🔒 敏感信息清洗: 检出 {stats['total_findings']} 处，已替换为 {stats['pool_size']} 个唯一值")
+            # 用清洗后的版本替换原文件
+            sanitized_path.replace(out_path)
+        else:
+            print("✅ 敏感信息清洗: 未检出敏感信息")
+            sanitized_path.unlink(missing_ok=True)
+    except ImportError:
+        print("⚠️ 未找到 clean 模块，跳过敏感信息清洗（确保 scripts 目录下有 clean.py）")
+
     print(f"\n📈 分类分布:")
     for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
         bar = "█" * int(count / len(cleaned) * 20) if cleaned else ""
