@@ -17,6 +17,7 @@ OpenClaw Self-Trainer - SFT 训练脚本（增量微调）
 import argparse
 import json
 import shutil
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -417,9 +418,392 @@ def run_rollback(data_dir=None):
     print(f"   到: {checkpoints[-2].name}")
 
 
-if __name__ == "__main__":
+# ─── 硬件检测与模型推荐 ──────────────────────────────────
+
+# 常见模型库：name → (类型, 参数描述, LoRA所需VRAM, QLoRA所需VRAM)
+MODEL_CATALOG = [
+    {"name": "Qwen/Qwen3.5-27B",       "type": "dense", "desc": "27B",       "lora_vram": 45,  "qlora_vram": 22},
+    {"name": "Qwen/Qwen3.5-35B-A3B",   "type": "MoE",   "desc": "35B总/3B激活", "lora_vram": 70, "qlora_vram": None},
+    {"name": "Qwen/Qwen3.5-122B-A10B", "type": "MoE",   "desc": "122B总/10B激活", "lora_vram": 200, "qlora_vram": None},
+    {"name": "Qwen/Qwen2.5-7B",        "type": "dense", "desc": "7B",        "lora_vram": 22,  "qlora_vram": 12},
+    {"name": "Qwen/Qwen2.5-14B",       "type": "dense", "desc": "14B",       "lora_vram": 30,  "qlora_vram": 16},
+]
+
+
+def detect_hardware():
+    """检测本地硬件信息"""
+    info = {
+        "gpu": [],
+        "gpu_total_vram_gb": 0,
+        "ram_gb": 0,
+        "disk_free_gb": 0,
+        "cpu_cores": 0,
+    }
+
+    # GPU 检测
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                if line.strip():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 2:
+                        info["gpu"].append({"name": parts[0], "vram_gb": float(parts[1])})
+                        info["gpu_total_vram_gb"] += float(parts[1])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # RAM 检测
+    try:
+        result = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                if line.startswith("Mem:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        info["ram_gb"] = _parse_size(parts[1])
+                    break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 磁盘检测
+    try:
+        result = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            lines = result.stdout.strip().split("\n")
+            if len(lines) >= 2:
+                parts = lines[1].split()
+                if len(parts) >= 4:
+                    info["disk_free_gb"] = _parse_size(parts[3])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # CPU 核心数
+    try:
+        result = subprocess.run(["nproc"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            info["cpu_cores"] = int(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return info
+
+
+def _parse_size(s):
+    """解析 free -h / df -h 输出的大小字符串（如 '16G', '500M'）"""
+    s = s.upper().strip().rstrip("I")
+    if s.endswith("T"):
+        return float(s[:-1]) * 1024
+    elif s.endswith("G"):
+        return float(s[:-1])
+    elif s.endswith("M"):
+        return float(s[:-1]) / 1024
+    return float(s)
+
+
+def run_suggest():
+    """根据硬件推荐模型和训练方案"""
+    hw = detect_hardware()
+
+    print("🖥️  硬件检测结果:")
+    print(f"   CPU 核心: {hw['cpu_cores']}")
+    print(f"   内存: {hw['ram_gb']:.1f} GB")
+    print(f"   磁盘剩余: {hw['disk_free_gb']:.1f} GB")
+    if hw["gpu"]:
+        for g in hw["gpu"]:
+            print(f"   GPU: {g['name']} ({g['vram_gb']:.0f} GB)")
+        print(f"   GPU 总 VRAM: {hw['gpu_total_vram_gb']:.0f} GB")
+    else:
+        print("   GPU: 未检测到")
+    print()
+
+    if not hw["gpu"]:
+        print("⚠️  未检测到 GPU，暂无法进行本地训练。")
+        print()
+        print("📋 推荐最小硬件需求:")
+        print("   - GPU: NVIDIA A100 40GB (或 V100 32GB, RTX 4090 24GB 等)")
+        print("   - 内存: ≥ 64 GB")
+        print("   - 磁盘: ≥ 100 GB 可用空间")
+        print()
+        print("💡 配有 GPU 后，重新运行此命令获取推荐方案。")
+        return
+
+    # 根据 VRAM 筛选可行方案
+    vram = hw["gpu_total_vram_gb"]
+    feasible = []
+    for m in MODEL_CATALOG:
+        if m["lora_vram"] <= vram:
+            feasible.append((m["name"], m["desc"], "LoRA", m["lora_vram"]))
+        if m.get("qlora_vram") and m["qlora_vram"] <= vram and m["lora_vram"] > vram:
+            feasible.append((m["name"], m["desc"], "QLoRA", m["qlora_vram"]))
+
+    if not feasible:
+        print("❌ 当前 GPU VRAM 不足以运行任何推荐模型。")
+        print(f"   可用 VRAM: {vram:.0f} GB | 最小需求: QLoRA 7B 需要 ~12 GB")
+        return
+
+    print("✅ 推荐方案（按 VRAM 占用排序）:")
+    feasible.sort(key=lambda x: x[3])
+    for i, (name, desc, method, req_vram) in enumerate(feasible, 1):
+        print(f"   {i}. {name} ({desc}) — {method} ~{req_vram} GB VRAM")
+
+    print()
+    print("💡 选择方案后运行:")
+    print(f'   python3 {__file__} set-model "模型名"')
+
+
+def run_set_model(model_name):
+    """将模型名写入 defaults.yaml"""
+    config_path = DEFAULT_CONFIG
+    config = load_config(config_path)
+
+    if not config:
+        config = {"base_model": {"name": None, "trust_remote_code": True}}
+
+    if "base_model" not in config:
+        config["base_model"] = {"name": None, "trust_remote_code": True}
+    config["base_model"]["name"] = model_name
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    print(f"✅ 基座模型已设置: {model_name}")
+    print(f"   配置文件: {config_path}")
+
+
+# ─── 数据准备 ──────────────────────────────────────────
+
+def run_prepare():
+    """将 collect.py 输出的 JSONL 转换为训练格式"""
+    config = load_config()
+    data_cfg = config.get("data", {})
+    source_dir = data_cfg.get("source_dir")
+    output_dir = data_cfg.get("prepare_output")
+    val_split = data_cfg.get("val_split", 0.1)
+    min_samples = data_cfg.get("min_samples", 50)
+
+    # 检查 source_dir
+    if not source_dir:
+        print("❌ data.source_dir 未配置，请先在 defaults.yaml 中设置，或运行 collect.py 收集数据。")
+        return
+
+    source_path = Path(source_dir).expanduser()
+    if not source_path.exists():
+        print(f"❌ 数据源目录不存在: {source_path}")
+        print("   请先运行 collect.py 收集数据。")
+        return
+
+    # 检查 output_dir
+    if not output_dir:
+        print("❌ data.prepare_output 未配置，请先在 defaults.yaml 中设置。")
+        return
+
+    output_path = Path(output_dir).expanduser()
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # 读取所有 JSONL 文件
+    samples = []
+    for jsonl_file in sorted(source_path.glob("*.jsonl")):
+        with open(jsonl_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        samples.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        print(f"⚠️  跳过无效 JSON 行: {jsonl_file}")
+
+    if len(samples) < min_samples:
+        print(f"❌ 样本数不足: {len(samples)} < {min_samples}（data.min_samples）")
+        return
+
+    import random
+    random.seed(42)
+    random.shuffle(samples)
+
+    n_val = max(1, int(len(samples) * val_split))
+    train_samples = samples[n_val:]
+    val_samples = samples[:n_val]
+
+    def convert(sample):
+        """将 OpenAI messages 格式转为训练格式"""
+        messages = sample.get("messages", [])
+
+        # 提取系统提示
+        instruction = "You are a helpful AI assistant."
+        for msg in messages:
+            if msg.get("role") == "system":
+                instruction = msg.get("content", instruction)
+                break
+
+        # 拼接多轮对话为文本
+        turns = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "system":
+                continue  # 已单独提取
+            if role == "user":
+                turns.append(f"<|im_start|>user\n{content}<|im_end|>")
+            elif role == "assistant":
+                turns.append(f"<|im_start|>assistant\n{content}<|im_end|>")
+            elif role == "toolResult":
+                turns.append(f"<|im_start|>tool\n{content}<|im_end|>")
+
+        text = "\n".join(turns)
+
+        # 最后一轮 assistant 回复作为 output
+        output = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                output = msg.get("content", "")
+                break
+
+        return {"instruction": instruction, "text": text, "output": output}
+
+    train_records = [convert(s) for s in train_samples]
+    val_records = [convert(s) for s in val_samples]
+
+    # 写入文件
+    train_file = output_path / "train.jsonl"
+    val_file = output_path / "val.jsonl"
+
+    with open(train_file, "w") as f:
+        for r in train_records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    with open(val_file, "w") as f:
+        for r in val_records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    print(f"✅ 数据准备完成:")
+    print(f"   总样本: {len(samples)}")
+    print(f"   训练集: {len(train_records)} → {train_file}")
+    print(f"   验证集: {len(val_records)} → {val_file}")
+
+
+# ─── 配置状态 ──────────────────────────────────────────
+
+def run_config_status():
+    """显示配置和训练状态"""
+    config = load_config()
+
+    print("📋 defaults.yaml 配置:")
+    if not config:
+        print("   ⚠️  配置文件为空或不存在")
+        print(f"   路径: {DEFAULT_CONFIG}")
+        return
+
+    # 基座模型
+    base = config.get("base_model", {})
+    model_name = base.get("name")
+    status_icon = "✅" if model_name else "❌ 未配置"
+    print(f"   基座模型: {status_icon}")
+    print(f"      {model_name or '(空)'}")
+    print(f"      trust_remote_code: {base.get('trust_remote_code', True)}")
+
+    # 训练参数
+    tr = config.get("training", {})
+    print(f"   训练方法: {tr.get('method', 'lora')}")
+    if tr.get("method") in ("lora", "qlora"):
+        print(f"   LoRA r/α/dropout: {tr.get('lora_r')}/{tr.get('lora_alpha')}/{tr.get('lora_dropout')}")
+    print(f"   Epochs: {tr.get('num_epochs')}, LR: {tr.get('learning_rate')}")
+    print(f"   Batch size: {tr.get('batch_size')} × {tr.get('gradient_accumulation_steps')} accum")
+    print(f"   Max seq length: {tr.get('max_seq_length')}")
+
+    # 数据配置
+    data = config.get("data", {})
+    src = data.get("source_dir")
+    out = data.get("prepare_output")
+    print(f"   数据源: {src or '❌ 未配置'}")
+    print(f"   输出目录: {out or '❌ 未配置'}")
+
+    # 检查数据目录文件
+    if out:
+        out_path = Path(out).expanduser()
+        if out_path.exists():
+            files = list(out_path.glob("*.jsonl"))
+            print(f"   已准备文件: {len(files)}")
+            for f in files:
+                count = sum(1 for _ in open(f) if _.strip())
+                print(f"      {f.name}: {count} 条")
+        else:
+            print("   ⚠️  输出目录不存在")
+
+    # 训练状态
+    print()
+    run_status()
+
+
+# ─── 训练（占位） ──────────────────────────────────────
+
+def run_train():
+    """训练命令占位 — 检查配置和数据完整性"""
+    config = load_config()
+
+    errors = []
+
+    # 检查基座模型
+    if not config.get("base_model", {}).get("name"):
+        errors.append("base_model.name 未配置 — 运行 --suggest 和 --set-model 选择模型")
+
+    # 检查数据
+    data = config.get("data", {})
+    output_dir = data.get("prepare_output")
+    if not output_dir:
+        errors.append("data.prepare_output 未配置")
+    else:
+        out_path = Path(output_dir).expanduser()
+        train_file = out_path / "train.jsonl"
+        val_file = out_path / "val.jsonl"
+        if not train_file.exists():
+            errors.append("训练数据未准备 — 运行 prepare 命令")
+        if not val_file.exists():
+            errors.append("验证数据未准备 — 运行 prepare 命令")
+
+    if errors:
+        print("❌ 训练前置检查未通过:")
+        for e in errors:
+            print(f"   • {e}")
+        return
+
+    model_name = config["base_model"]["name"]
+    tr = config.get("training", {})
+
+    print("✅ 配置检查通过，训练将由 agent 按照以下配置执行:")
+    print(f"   模型: {model_name}")
+    print(f"   方法: {tr.get('method', 'lora')}")
+    print(f"   Epochs: {tr.get('num_epochs')}, LR: {tr.get('learning_rate')}")
+    print(f"   训练数据: {output_dir}/train.jsonl")
+    print(f"   验证数据: {output_dir}/val.jsonl")
+    print()
+    print("⚠️  实际训练逻辑待实现（需要 GPU 环境）")
+
+
+def main():
+    """主入口：使用 subcommand 解析"""
     parser = argparse.ArgumentParser(description="OpenClaw Self-Trainer 增量微调")
     sub = parser.add_subparsers(dest="command")
+
+    # suggest: 硬件检测 + 模型推荐
+    sub.add_parser("suggest", help="检测硬件并推荐模型方案")
+
+    # set-model: 设置基座模型
+    p_set = sub.add_parser("set-model", help="设置基座模型")
+    p_set.add_argument("model_name", type=str, help="模型名称")
+
+    # prepare: 数据准备
+    sub.add_parser("prepare", help="将收集的数据转换为训练格式")
+
+    # config-status: 配置和训练状态
+    sub.add_parser("config-status", help="查看配置和训练状态")
+
+    # train: 训练（占位）
+    sub.add_parser("train", help="训练模型（检查配置后由 agent 执行）")
 
     # auto: 自动增量训练（cron 调用）
     p_auto = sub.add_parser("auto", help="自动增量训练（检查新数据，够就训练）")
@@ -431,7 +815,7 @@ if __name__ == "__main__":
     p_init.add_argument("--base-model", type=str, default=None, help="基座模型路径")
     p_init.add_argument("--data-dir", type=str, default=None)
 
-    # status: 查看状态
+    # status: 查看状态（原有）
     sub.add_parser("status", help="查看训练状态")
 
     # rollback: 回滚
@@ -447,7 +831,17 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.command == "auto":
+    if args.command == "suggest":
+        run_suggest()
+    elif args.command == "set-model":
+        run_set_model(args.model_name)
+    elif args.command == "prepare":
+        run_prepare()
+    elif args.command == "config-status":
+        run_config_status()
+    elif args.command == "train":
+        run_train()
+    elif args.command == "auto":
         run_auto(data_dir=args.data_dir, config_path=args.config)
     elif args.command == "init":
         run_init(data_dir=args.data_dir, base_model=args.base_model)
@@ -464,3 +858,7 @@ if __name__ == "__main__":
         )
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
