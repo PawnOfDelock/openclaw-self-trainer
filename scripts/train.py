@@ -625,9 +625,58 @@ def run_prepare():
     random.seed(42)
     random.shuffle(samples)
 
-    n_val = max(1, int(len(samples) * val_split))
-    train_samples = samples[n_val:]
-    val_samples = samples[:n_val]
+    # ─── 增量 test set 分割 ──────────────────────────
+    # 每次增量时，从新数据中抽取 test_split 比例加入 test set。
+    # 新数据从未参与过训练，保证 test set 的独立性。
+    test_split = data_cfg.get("test_split", 0.1)
+    test_max_size = data_cfg.get("test_max_size")
+
+    test_file = output_path / "test.jsonl"
+    existing_test_ids = set()
+
+    # 读取已有 test set，记录已存在的样本 ID（避免重复）
+    if test_file.exists():
+        with open(test_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        existing_test_ids.add(line)  # 用原始 JSON 行做去重
+                    except Exception:
+                        pass
+
+    # 计算本次新增样本（排除已有 test 中的）
+    new_for_test = []
+    remaining = []
+    for s in samples:
+        s_line = json.dumps(s, ensure_ascii=False)
+        if s_line not in existing_test_ids and random.random() < test_split:
+            new_for_test.append(s)
+        else:
+            remaining.append(s)
+
+    # 追加新 test 样本
+    if new_for_test:
+        with open(test_file, "a") as f:
+            for s in new_for_test:
+                f.write(json.dumps(s, ensure_ascii=False) + "\n")
+        print(f"   📎 新增 test 样本: {len(new_for_test)} 条")
+
+    # test set 滚动窗口：超过上限时丢弃最早的样本
+    if test_max_size and test_file.exists():
+        with open(test_file) as f:
+            all_test_lines = [l.strip() for l in f if l.strip()]
+        if len(all_test_lines) > test_max_size:
+            trimmed = all_test_lines[-test_max_size:]
+            with open(test_file, "w") as f:
+                for l in trimmed:
+                    f.write(l + "\n")
+            print(f"   ✂️  test set 裁剪: {len(all_test_lines)} → {len(trimmed)}")
+
+    # ─── train/val 分割 ──────────────────────────────
+    n_val = max(1, int(len(remaining) * val_split))
+    train_samples = remaining[n_val:]
+    val_samples = remaining[:n_val]
 
     def convert(sample):
         """将 OpenAI messages 格式转为训练格式"""
@@ -680,10 +729,17 @@ def run_prepare():
         for r in val_records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+    # 统计 test set 大小
+    test_count = 0
+    if test_file.exists():
+        with open(test_file) as f:
+            test_count = sum(1 for l in f if l.strip())
+
     print(f"✅ 数据准备完成:")
     print(f"   总样本: {len(samples)}")
     print(f"   训练集: {len(train_records)} → {train_file}")
     print(f"   验证集: {len(val_records)} → {val_file}")
+    print(f"   测试集: {test_count} 条 → {test_file}")
 
 
 # ─── 配置状态 ──────────────────────────────────────────

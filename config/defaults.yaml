@@ -21,6 +21,8 @@ data:
   source_dir: null        # collect.py 输出目录
   prepare_output: null    # 转换后的训练数据目录
   val_split: 0.1          # 验证集比例
+  test_split: 0.1         # 每次增量时抽取新数据的 10% 加入 test set
+  test_max_size: null     # test set 上限（null=不限），超出时丢弃最早样本
   min_samples: 50         # 最少训练样本数
 
 # 路径
